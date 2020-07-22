@@ -61,6 +61,9 @@ from trax.fastmath import random as jax_random
 class Loop:
   """Loop that can run for a given number of steps to train a supervised model.
 
+  Can train the model on multiple tasks by interleaving updates according to the
+  task_at() argument.
+
   The typical supervised training process randomly initializes a model and
   updates its weights via feedback (loss-derived gradients) from a training
   task, by looping through batches of labeled data. A training loop can also
@@ -86,9 +89,19 @@ class Loop:
       repeatable generation of pseudo-random numbers
   """
 
-  def __init__(self, model, tasks, eval_model=None, eval_tasks=None,
-               output_dir=None, checkpoint_at=None, eval_at=None,
-               n_devices=None, random_seed=None):
+  def __init__(
+      self,
+      model,
+      tasks,
+      eval_model=None,
+      eval_tasks=None,
+      output_dir=None,
+      checkpoint_at=None,
+      eval_at=None,
+      task_at=None,
+      n_devices=None,
+      random_seed=None,
+  ):
     """Configures a training `Loop`, including a random initialization.
 
     Args:
@@ -111,6 +124,9 @@ class Loop:
           periodic checkpointing at `task.n_steps_per_checkpoint`.
       eval_at: Function (integer --> boolean) that says, for training step n,
           whether that step should run evals. If None, run when checkpointing.
+      task_at: Function (integer --> integer) indicating which task should be
+          used at which training step. Can be set to None in single-task
+          training.
       n_devices: integer or None, the number of devices for this computation.
       random_seed: the random seed to use; time/os dependent if None (default).
     """
@@ -121,19 +137,18 @@ class Loop:
     if not isinstance(tasks, (list, tuple)):
       tasks = [tasks]
 
-    assert len(tasks) == 1, 'Multitask training not supported yet.'
-    task = tasks[0]
+    assert tasks, 'Must provide at least one task to interleave.'
     if eval_tasks is None:
-      eval_task = None
+      eval_tasks = (None,) * len(tasks)
+      eval_at = _never
     else:
-      assert len(eval_tasks) == 1, 'Multitask training not supported yet.'
-      eval_task = eval_tasks[0]
+      if not isinstance(eval_tasks, (list, tuple)):
+        eval_tasks = [eval_tasks]
 
-    self._task = task
+    self._tasks = tasks
     self._model = model
     self._eval_model = eval_model or model
-    default_at = (
-        _at_step_1_and_every_nth_step(self._task.n_steps_per_checkpoint))
+    default_at = _at_step_1_and_every_nth_step(tasks[0].n_steps_per_checkpoint)
     if output_dir is not None:
       self._output_dir = os.path.expanduser(output_dir)
       tf.io.gfile.makedirs(self._output_dir)
@@ -143,14 +158,17 @@ class Loop:
     # Prepare training components.
     self._step = 0
     self._checkpoint_at = checkpoint_at or default_at
-    self._batch_signature = shapes.signature(self._task.sample_batch)
-    self._model_in_training = tl.Serial(self._model, self._task.loss_layer)
+    if task_at is None:
+      assert len(tasks) == 1, 'Must provide task_at for multitask training.'
+      task_at = lambda _: 0
+    self._task_at = task_at
 
     # Initialize using the given random seed.
     # NOTE: If `random_seed` is `None` then `self._rng` will be different on
     # different hosts, leading to different weights on the different hosts.
-    self._model_in_training.rng = self.new_rng()
-    self._model_in_training.init(self._batch_signature)
+    self._batch_signature = shapes.signature(tasks[0].sample_batch)
+    self._model.rng = self.new_rng()
+    self._model.init(self._batch_signature)
     self._eval_model.rng = self.new_rng()
     self._eval_model.init(self._batch_signature)
 
@@ -158,38 +176,87 @@ class Loop:
     # and state and average them.
     # NOTE: This adds time (how much?) so we prefer not to do it if it is
     # unnecessary, i.e. random_seed was set.
+    # NOTE: Averaging the weights across devices can screw up the initial weight
+    # statistics.
+    # TODO(pkozakowski): Broadcast from one of the devices instead?
     if random_seed is None and self._n_hosts > 1:
       logging.info('Syncing weights/state across %d hosts.', self._n_hosts)
       self._sync_weights_and_state_across_hosts()
 
-    # Restore from checkpoint if there's one after initializing optimizer slots.
-    self._task.optimizer.tree_init(self._model_in_training.weights)
+    # Build the per-task models, sharing weights with self._model.
+    def select_head(model, task_index):
+      return tl.Serial(model, tl.Select([task_index], n_in=len(tasks)))
+
+    self._model_in_training_per_task = tuple(
+        _model_with_ends(  # pylint: disable=g-complex-comprehension
+            select_head(self._model, task_index),
+            [task.loss_layer],
+            shapes.signature(task.sample_batch)
+        )
+        for (task_index, task) in enumerate(tasks)
+    )
+
+    for (task, model_in_training) in zip(
+        self._tasks, self._model_in_training_per_task
+    ):
+      task.optimizer.tree_init(model_in_training.weights)
     self.load_checkpoint()
 
     # Create the optimizer for the training loss function.
-    self._trainer = optimizers.Trainer(
-        self._model_in_training, self._task.optimizer)
+    self._trainer_per_task = tuple(
+        optimizers.Trainer(model_in_training, task.optimizer)
+        for (model_in_training, task) in zip(
+            self._model_in_training_per_task, self._tasks
+        )
+    )
 
     # Prepare eval components.
-    if eval_task is None:
-      self._eval_at = _never
-    else:
-      self._eval_task = eval_task
-      self._eval_at = eval_at or default_at
-      metric_name_lengths = [len(name) for name in self._eval_task.metric_names]
-      self._rjust_len = max(
-          [len(self._task.loss_layer.name)] + metric_name_lengths)
-      model_with_metrics = (
-          _model_with_metrics(self._eval_model, self._eval_task))
-      # Keep self._eval_{weights/state} replicated.
-      self._eval_weights = self._for_n_devices(
-          model_with_metrics.weights[1])  # just the eval part
-      self._eval_state = self._for_n_devices(
-          model_with_metrics.state[1])  # just the eval part
-      self._metrics_fn = _accelerate_model_with_metrics(
-          model_with_metrics, self.n_devices)
-      if self._output_dir is None:
-        _log('Will not write evaluation metrics, because output_dir is None.')
+    self._eval_at = eval_at or default_at
+    self._eval_tasks = eval_tasks
+    loss_names = [task.loss_layer.name for task in self._tasks]
+    metric_names = [
+        name  # pylint: disable=g-complex-comprehension,g-long-ternary
+        for eval_task in eval_tasks if eval_task is not None
+        for name in eval_task.metric_names
+    ]
+    self._rjust_len = max(map(len, loss_names + metric_names))
+    model_with_metrics_per_task = tuple(
+        _model_with_metrics(  # pylint: disable=g-complex-comprehension,g-long-ternary
+            select_head(self._eval_model, task_index), eval_task
+        )
+        if eval_task is not None else None
+        for (task_index, eval_task) in enumerate(eval_tasks)
+    )
+    # Keep self._eval_{weights/state} replicated.
+    self._eval_weights_per_task = tuple(  # pylint: disable=g-complex-comprehension,g-long-ternary
+        self._for_n_devices(model_with_metrics.weights[1])  # just the eval part
+        if model_with_metrics is not None else None
+        for model_with_metrics in model_with_metrics_per_task
+    )
+    self._eval_state_per_task = tuple(  # pylint: disable=g-complex-comprehension,g-long-ternary
+        self._for_n_devices(model_with_metrics.state[1])  # just the eval part
+        if model_with_metrics is not None else None
+        for model_with_metrics in model_with_metrics_per_task
+    )
+    self._metrics_fn_per_task = tuple(  # pylint: disable=g-complex-comprehension,g-long-ternary
+        _accelerate_model_with_metrics(model_with_metrics, self.n_devices)
+        if model_with_metrics is not None else None
+        for model_with_metrics in model_with_metrics_per_task
+    )
+
+    if self._output_dir is None:
+      _log('Will not write evaluation metrics, because output_dir is None.')
+
+    def task_output_dir(task_index):
+      if self._output_dir is not None:
+        output_dir = os.path.join(self._output_dir, str(task_index))
+        tf.io.gfile.makedirs(output_dir)
+        return output_dir
+      else:
+        return None
+    self._output_dir_per_task = tuple(
+        map(task_output_dir, range(len(eval_tasks)))
+    )
 
   def _sync_weights_and_state_across_hosts(self):
     """Sync weights and state across all the hosts in the computation."""
@@ -198,28 +265,25 @@ class Loop:
       logging.debug(
           'Input training weights shape: %s',
           fastmath.nested_map(lambda x: x.shape,
-                              self._model_in_training.weights))
-      logging.debug('Input training weights: %s',
-                    self._model_in_training.weights)
-      logging.debug('Input training state: %s', self._model_in_training.state)
+                              self._model.weights))
+      logging.debug('Input training weights: %s', self._model.weights)
+      logging.debug('Input training state: %s', self._model.state)
       logging.debug('Input eval weights: %s', self._eval_model.weights)
       logging.debug('Input eval state: %s', self._eval_model.state)
 
-    (self._model_in_training.weights, self._model_in_training.state,
+    (self._model.weights, self._model.state,
      self._eval_model.weights, self._eval_model.state) = self._unreplicate(
          _make_weights_and_state_same_across_hosts(
              self._for_n_devices(
-                 (self._model_in_training.weights,
-                  self._model_in_training.state, self._eval_model.weights,
+                 (self._model.weights, self._model.state,
+                  self._eval_model.weights,
                   self._eval_model.state))))
 
     if logging.vlog_is_on(1):
       logging.debug(
           'Output training weights shape: %s',
-          fastmath.nested_map(lambda x: x.shape,
-                              self._model_in_training.weights))
-      logging.debug('Output training weights: %s',
-                    self._model_in_training.weights)
+          fastmath.nested_map(lambda x: x.shape, self._model.weights))
+      logging.debug('Output training weights: %s', self._model.weights)
       logging.debug('Output training state: %s', self._model_in_training.state)
       logging.debug('Output eval weights: %s', self._eval_model.weights)
       logging.debug('Output eval state: %s', self._eval_model.state)
@@ -232,14 +296,16 @@ class Loop:
     Args:
       n_steps: Stop training after completing n steps.
     """
-    with self._open_summary_writers() as (train_summary_writer,
-                                          eval_summary_writer):
+    with self._open_summary_writers(('train', 'eval')) as (
+        train_summary_writers, eval_summary_writers
+    ):
       loss_acc, step_acc = 0.0, 0
       start_time = time.time()
       optimizer_metrics_acc = collections.defaultdict(float)
       for _ in range(n_steps):
         self._step += 1
-        loss, optimizer_metrics = self._run_one_step()
+        task_index = self._task_at(self._step)
+        loss, optimizer_metrics = self._run_one_step(task_index)
 
         # optimizer_metrics and loss are replicated on self.n_devices, a few
         # metrics are replicated (ex: gradients_l2, weights_l2) - i.e. they are
@@ -258,21 +324,20 @@ class Loop:
         for metric_name, value in optimizer_metrics.items():
           optimizer_metrics_acc[metric_name] += value
 
-        should_checkpoint = self._checkpoint_at(self.step)
-        should_eval = self._eval_at(self.step)
-        if should_checkpoint:
-          self.save_checkpoint(
-              self._model_in_training.weights,
-              self._model_in_training.state,
-              self._task.optimizer.slots)
-        if should_eval:
+        if self._checkpoint_at(self.step):
+          self.save_checkpoint()
+        if self._eval_at(self.step):
           elapsed_time = time.time() - start_time
           self._eval_model.weights = self._model.weights
           self._log_training_progress(
-              total_loss=loss_acc, n_steps=step_acc, elapsed_time=elapsed_time,
+              task=self._tasks[task_index],
+              total_loss=loss_acc,
+              n_steps=step_acc,
+              elapsed_time=elapsed_time,
               optimizer_metrics=optimizer_metrics_acc,
-              summary_writer=train_summary_writer)
-          self.run_evals(summary_writer=eval_summary_writer)
+              summary_writer=train_summary_writers[task_index],
+          )
+          self.run_evals(eval_summary_writers)
           loss_acc, step_acc = 0.0, 0
           start_time = time.time()
           optimizer_metrics_acc = collections.defaultdict(float)
@@ -331,21 +396,27 @@ class Loop:
       return x
     return tl.reshape_by_device(x, self.n_devices)
 
-  def _run_one_step(self):
+  def _run_one_step(self, task_index):
     """Updates model weights/state and optimizer slots by running one step.
+
+    Args:
+      task_index (int): Index of the task to train on.
 
     Returns:
       Tuple (loss, stats) with loss value from one step
       of training and stats, the current optimizer statistics.
     """
     step = self.step
-    learning_rate = self._task.learning_rate(step)
-    batch = self._task.next_batch()
+    learning_rate = self._tasks[task_index].learning_rate(step)
+    batch = self._tasks[task_index].next_batch()
     rng = self.new_rng()
-    return self._trainer.one_step(
-        batch, rng, step=step, learning_rate=learning_rate)
+    trainer = self._trainer_per_task[task_index]
+    # Re-replicate weights and state to synchronize them between tasks.
+    trainer.accelerated_loss_layer.replicate_weights(trainer.loss_layer.weights)
+    trainer.accelerated_loss_layer.replicate_state(trainer.loss_layer.state)
+    return trainer.one_step(batch, rng, step=step, learning_rate=learning_rate)
 
-  def _log_training_progress(self, total_loss, n_steps, elapsed_time,
+  def _log_training_progress(self, task, total_loss, n_steps, elapsed_time,
                              optimizer_metrics, summary_writer):
     """Logs training related metrics.
 
@@ -357,13 +428,14 @@ class Loop:
     to the provided summary writer. Training loss is also logged to stdout.
 
     Args:
+      task (TrainTask): The current task.
       total_loss: Total training loss accumulated over n_steps training steps.
       n_steps: Number of steps over which the metrics were accumulated.
       elapsed_time: Time of execusion of n_steps training steps.
       optimizer_metrics: Dict from optimizer metric name to metric values.
       summary_writer: Jaxboard summary writer for saving provided metrics.
     """
-    loss_name = self._task.loss_layer.name
+    loss_name = task.loss_layer.name
     # only here do avoid potential divide-by-0
     n_steps = max(1, n_steps)
     _log('')  # Separator for visibility on terminals.
@@ -374,7 +446,7 @@ class Loop:
     if self.step == 1:
       self._save_gin(summary_writer)
     train_parameters = {
-        'learning_rate': self._task.learning_rate(self.step),
+        'learning_rate': task.learning_rate(self.step),
         'steps per second': n_steps / elapsed_time,
     }
     # Average optimizer_metrics over n_steps.
@@ -383,62 +455,71 @@ class Loop:
     self._log_scalars(
         train_parameters, summary_writer, 'training/', 'train', stdout=False)
 
-  def _save_gin(self, summary_writer=None):
+  def _save_gin(self, summary_writer):
     """"Saves the operative gin config."""
-    if not self.is_chief:
+    if not self.is_chief or self._output_dir is None:
       return
-    assert self._output_dir is not None
     config_path = os.path.join(self._output_dir, 'config.gin')
     config_str = gin.operative_config_str()
     with tf.io.gfile.GFile(config_path, 'w') as f:
       f.write(config_str)
     if summary_writer is not None:
-      summary_writer.text('gin_config',
-                          jaxboard.markdownify_operative_config_str(config_str))
+      summary_writer.text(
+          'gin_config', jaxboard.markdownify_operative_config_str(config_str)
+      )
 
   # TODO(afrozm): Fix multi-host evals, right now the reported numbers in the
   #   summary writer are only from the chief and not averaged across hosts.
-  def run_evals(self, weights=None, state=None, summary_writer=None):
+  def run_evals(self, summary_writers=None):
     """Runs and records evals for this training session.
 
     Args:
-      weights: Current weights from model in training.
-      state: Current state from model in training.
-      summary_writer: Jaxboard summary writer to log metrics.
+      summary_writers: List of per-task Jaxboard summary writers to log metrics.
     """
+    if summary_writers is None:
+      summary_writers = (None,) * len(self._eval_tasks)
 
-    # If weights and state are provided, they are used as is, otherwise we get
-    # them from the training model (they are stored unreplicated) and replicate
-    # them. Replication will only happen if necessary i.e. self.n_devices > 1.
-    weights = (
-        weights if weights is not None else self._for_n_devices(
-            self._model_in_training.weights))
-    state = (
-        state if state is not None else self._for_n_devices(
-            self._model_in_training.state))
+    self._eval_model.weights = self._model.weights
+    self._eval_model.state = self._model.state
 
-    # From the above weights and state, create the weights and state of the
-    # eval model.
-    model_weights = weights[0]  # exclude weights from the loss layer
-    model_state = state[0]  # exclude state from the loss layer
+    for task_index in range(len(self._eval_tasks)):
+      eval_task = self._eval_tasks[task_index]
+      if eval_task is None:
+        continue
 
-    # self._eval_{weights/state} are already replicated.
-    metrics_weights = (model_weights, self._eval_weights)
-    metrics_state = (model_state, self._eval_state)
+      model_in_training = self._model_in_training_per_task[task_index]
+      eval_weights = self._eval_weights_per_task[task_index]
+      eval_state = self._eval_state_per_task[task_index]
+      metrics_fn = self._metrics_fn_per_task[task_index]
+      summary_writer = summary_writers[task_index]
 
-    eval_task = self._eval_task
-    n_batches = eval_task.n_eval_batches
-    n_metrics = len(eval_task.metrics)
-    sums = np.zeros((n_metrics,))
-    for _ in range(n_batches):
-      rng = self.new_rng()
-      batch = eval_task.next_batch()
-      metric_values, _ = (
-          self._metrics_fn(batch, metrics_weights, metrics_state, rng))
-      sums += metric_values
-    averages = sums / n_batches
-    all_metrics = dict(zip(eval_task.metric_names, averages))
-    self._log_scalars(all_metrics, summary_writer, 'metrics/', 'eval')
+      # We get the weights and state from the training model (they are stored
+      # unreplicated) and replicate them. Replication will only happen if
+      # necessary i.e. self.n_devices > 1.
+      weights = self._for_n_devices(model_in_training.weights)
+      state = self._for_n_devices(model_in_training.state)
+
+      # From the above weights and state, create the weights and state of the
+      # eval model.
+      model_weights = weights[0]  # exclude weights from the loss layer
+      model_state = state[0]  # exclude state from the loss layer
+
+      # self._eval_{weights/state} are already replicated.
+      metrics_weights = (model_weights, eval_weights)
+      metrics_state = (model_state, eval_state)
+
+      n_batches = eval_task.n_eval_batches
+      n_metrics = len(eval_task.metrics)
+      sums = np.zeros((n_metrics,))
+      for _ in range(n_batches):
+        rng = self.new_rng()
+        batch = eval_task.next_batch()
+        metric_values, _ = metrics_fn(
+            batch, metrics_weights, metrics_state, rng)
+        sums += metric_values
+      averages = sums / n_batches
+      all_metrics = dict(zip(eval_task.metric_names, averages))
+      self._log_scalars(all_metrics, summary_writer, 'metrics/', 'eval')
 
   def _log_scalars(self, scalars, summary_writer, scalar_prefix, log_prefix,
                    stdout=True):
@@ -467,30 +548,25 @@ class Loop:
     """Logs message, labeled with the current training step number."""
     _log('Step % 6d: %s' % (self.step, msg), stdout=stdout)
 
-  def save_checkpoint(self, weights=None, state=None, slots=None):
-    """Saves checkpoint to disk for the current training step.
-
-    Args:
-      weights: Weights from model being trained.
-      state: State (non-weight parameters) from model being trained.
-      slots: Updatable weights for the optimizer in this training loop.
-    """
-    if not self.is_chief:
-      return
+  def save_checkpoint(self):
+    """Saves checkpoint to disk for the current training step."""
     if self._output_dir is None:
-      _log('Did not save checkpoint as output_dir is None', stdout=False)
+      _log('Did not save checkpoint as output_dir is None')
       return
-    weights = self._model_in_training.weights if weights is None else weights
-    state = self._model_in_training.state if state is None else state
-    slots = self._task.optimizer.slots if slots is None else slots
+    weights = self._model.weights
+    state = self._model.state
+    slots_per_task = tuple(task.optimizer.slots for task in self._tasks)
+    # We only need the input signature for the body, not for the loss layers.
+    # That part is the same across tasks - take it from the first one.
+    input_signature = self._batch_signature[:self._model.n_in]
     flat_weights, flat_state = tl.flatten_weights_and_state(weights, state)
     d = {
         'step': self.step,
         'flat_weights': flat_weights,
         'flat_state': flat_state,
-        'slots': slots,
-        'input_signature': self._batch_signature,
-        'version_timestamp': 'Jun-29-2020'  # To update in the future if needed.
+        'slots_per_task': slots_per_task,
+        'input_signature': input_signature,
+        'version_timestamp': 'Aug-05-2020'  # To update in the future if needed.
     }
     ckpt_file = os.path.join(self._output_dir, 'model.pkl.gz')
     pickle_to_file(d, ckpt_file, gzip=True)
@@ -515,36 +591,73 @@ class Loop:
       return
     d = unpickle_from_file(path, gzip=True)
     self._step = d['step']
-    self._task.optimizer.slots = d['slots']
+    for (task, slots) in zip(self._tasks, d['slots_per_task']):
+      task.optimizer.slots = slots
     # TODO(lukaszkaiser): this call will read the file again, optimize it.
-    self._model_in_training.init_from_file(path)
+    self._model.init_from_file(path)
     self._eval_model.weights = self._model.weights
+    self._eval_model.state = self._model.state
 
   @contextlib.contextmanager
-  def _open_summary_writers(self):
+  def _open_summary_writers(self, subdirs):
     """Opens the Jaxboard summary writers wrapped by context manager.
 
+    Args:
+      subdirs: List of names of subdirectories to open summary writers for.
+
     Yields:
-      Tuple (train_summary_writer, eval_summary_writer) of Jaxboard summary
-      writers wrapped by the GeneratorContextManager object.
-      If there was no output_dir provided, yields (None, None).
+      Tuple (writers_1, ..., writers_n) of tuples of Jaxboard summary
+      writers wrapped in a GeneratorContextManager object. Elements of the outer
+      tuple correspond to subdirs. Elements of the inner tuples correspond to
+      tasks. If there was no output_dir provided, yields the same nested tuple
+      of None writers.
     """
     if self._output_dir is not None:
-      _log('Training and evaluation metrics will be written in %s.' %
-           self._output_dir, stdout=False)
-      train_summary_writer = jaxboard.SummaryWriter(
-          os.path.join(self._output_dir, 'train'))
-      eval_summary_writer = jaxboard.SummaryWriter(
-          os.path.join(self._output_dir, 'eval'))
+      _log(
+          'Metrics will be written in {}.'.format(self._output_dir),
+          stdout=False,
+      )
+      writer_per_subdir_and_task = tuple(
+          tuple(  # pylint: disable=g-complex-comprehension
+              jaxboard.SummaryWriter(os.path.join(output_dir, subdir))
+              for output_dir in self._output_dir_per_task
+          )
+          for subdir in subdirs
+      )
       try:
-        yield train_summary_writer, eval_summary_writer
+        yield writer_per_subdir_and_task
       finally:
-        train_summary_writer.close()
-        eval_summary_writer.close()
-        _log('Training and evaluation metrics were written in %s.' %
-             self._output_dir, stdout=False)
+        for writer_per_task in writer_per_subdir_and_task:
+          for writer in writer_per_task:
+            writer.close()
+        _log(
+            'Metrics were written in {}.'.format(self._output_dir), stdout=False
+        )
     else:
-      yield None, None
+      yield ((None,) * len(self._tasks),) * len(subdirs)
+
+
+def _model_with_ends(model, end_layers, batch_signature):
+  """Returns a model+ends layer built on an already initialized model.
+
+  Ends can be loss or metric layers.
+
+  Args:
+    model: Layer with initialized weights and state.
+    end_layers: List of end layers.
+    batch_signature: Signature of the model input batch.
+
+  Returns:
+    An initialized, combined model+ends layer, preserving the initialization
+    of `model`.
+  """
+  # TODO(jonni): Redo this function as part of an initialization refactor?
+  metrics_layer = tl.Branch(*end_layers)
+  metrics_input_signature = model.output_signature(batch_signature)
+  _, _ = metrics_layer.init(metrics_input_signature)
+
+  model_with_metrics = tl.Serial(model, metrics_layer)
+  return model_with_metrics
 
 
 def _model_with_metrics(model, eval_task):
@@ -558,23 +671,16 @@ def _model_with_metrics(model, eval_task):
     An initialized, combined model+metrics layer, preserving the initialization
     of `model`.
   """
-  # TODO(jonni): Redo this function as part of an initialization refactor?
-  metrics_layer = tl.Branch(*eval_task.metrics)
-  eval_data_signature = shapes.signature(eval_task.sample_batch)
-  metrics_input_signature = model.output_signature(eval_data_signature)
-  _, _ = metrics_layer.init(metrics_input_signature)
-
-  # TODO(afrozm): Should we set model_with_metrics._rng, tl.Serial will assign
-  #  one in any case. But its weights aren't used, so no harm in either case.
-  model_with_metrics = tl.Serial(model, metrics_layer)
-  return model_with_metrics
+  return _model_with_ends(
+      model, eval_task.metrics, shapes.signature(eval_task.sample_batch)
+  )
 
 
 class TrainTask:
   """A supervised task (labeled data + feedback mechanism) for training."""
 
-  def __init__(self, labeled_data, loss_layer, optimizer, lr_schedule=None,
-               n_steps_per_checkpoint=100):
+  def __init__(self, labeled_data, loss_layer, optimizer,
+               lr_schedule=None, n_steps_per_checkpoint=100):
     r"""Configures a training task.
 
     Args:
