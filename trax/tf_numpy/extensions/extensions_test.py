@@ -133,7 +133,7 @@ class ExtensionsTest(tf.test.TestCase, parameterized.TestCase):
 
       return y, vjp
 
-    rng = tf.random.Generator.from_seed(1234)
+    rng = tf.random.Generator.from_seed(np.random.randint(1, 9999999))
     x, dy = tf.nest.map_structure(lambda shape: uniform(rng, shape, dtype),
                                   [x_shape, y_shape])
     expected_y = fwd(*x)
@@ -197,7 +197,7 @@ class ExtensionsTest(tf.test.TestCase, parameterized.TestCase):
       else:
         return y
 
-    rng = tf.random.Generator.from_seed(1234)
+    rng = tf.random.Generator.from_seed(np.random.randint(1, 9999999))
     x, dy_list = tf.nest.map_structure(lambda shape: uniform(rng, shape, dtype),
                                        [x_shape, [y_shape] * 2])
     tf_x = to_tf(x)

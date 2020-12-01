@@ -131,7 +131,7 @@ class Trax2KerasTest(tf.test.TestCase, parameterized.TestCase):
       input_sig = trax2keras.tensor_shapes_to_shape_dtypes(input_shapes, dtype)
       initializer_rng = math_lib.random.get_prng(765)
       weights, state = trax_layer.init(input_sig, rng=initializer_rng)
-      generator = tf.random.Generator.from_seed(567)
+      generator = tf.random.Generator.from_seed(onp.random.randint(1, 9999999))
       def get_inputs():
         return dummy_inputs(generator, input_sig)
       if trax_has_weights:

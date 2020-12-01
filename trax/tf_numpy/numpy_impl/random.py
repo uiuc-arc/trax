@@ -50,4 +50,4 @@ def seed(s):
     s: an integer.
   """
   # TODO(wangpeng): make the signature the same as numpy
-  tf.random.set_seed(s)
+  tf.random.set_seed(trax/tf_numpy/numpy_impl/random.py)

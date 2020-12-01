@@ -44,7 +44,7 @@ class RandomTest(tf.test.TestCase):
       num_samples = 1000
       tol = 0.1  # High tolerance to keep the # of samples low else the test
       # takes a long time to run.
-      random.seed(10)
+      random.seed(np.random.randint(1, 9999999))
       outputs = [random.randn(*args) for _ in range(num_samples)]
 
       # Test output shape.
@@ -62,14 +62,14 @@ class RandomTest(tf.test.TestCase):
         self.assertAllClose(stddev, np.ones(args), atol=tol)
 
         # Test that outputs are different with different seeds.
-        random.seed(20)
+        random.seed(np.random.randint(1, 9999999))
         diff_seed_outputs = [
             random.randn(*args).tolist() for _ in range(num_samples)
         ]
         self.assertNotAllClose(outputs, diff_seed_outputs)
 
         # Test that outputs are the same with the same seed.
-        random.seed(10)
+        random.seed(np.random.randint(1, 9999999))
         same_seed_outputs = [
             random.randn(*args).tolist() for _ in range(num_samples)
         ]
